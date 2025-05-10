@@ -1,6 +1,7 @@
 use eframe::egui;
 use std::sync::mpsc::{channel, Sender, Receiver};
 use std::thread::{self, JoinHandle};
+use std::net::TcpStream; // Added for TCP connection
 
 // Import rdev types needed for the listener functionality
 // (These were previously commented out at the bottom or in a different scope)
@@ -34,7 +35,7 @@ pub struct SerializableRdevEvent {
     ButtonRelease(RdevButton),
     MouseMove { x: f64, y: f64 },
     Wheel { delta_x: i64, delta_y: i64 },
-    // We might need an Unknown variant if rdev::EventType has one we need to pass through
+    Unknown { code: u32, event_type_code: u16 }, // Represents an event we couldn't specifically map
 }
 
 // Helper to convert from rdev::Event to SerializableRdevEvent
@@ -49,9 +50,12 @@ impl From<RdevEvent> for SerializableRdevEvent {
                 RdevEventType::ButtonRelease(b) => SerializableRdevEventType::ButtonRelease(b),
                 RdevEventType::MouseMove { x, y } => SerializableRdevEventType::MouseMove { x, y },
                 RdevEventType::Wheel { delta_x, delta_y } => SerializableRdevEventType::Wheel { delta_x, delta_y },
-                // rdev::EventType can have other variants like UnknownKey or platform specific ones.
-                // We need to decide how to handle them. For now, we panic or map to a specific variant if we add one.
-                _ => panic!("Unsupported rdev::EventType for serialization: {:?}", event.event_type),
+                // RdevEventType::Unknown is not a variant with {code, event_type}. 
+                // We catch all other rdev event types here.
+                other => {
+                    println!("Warning: Unhandled rdev::EventType {:?}. Mapping to generic Unknown.", other);
+                    SerializableRdevEventType::Unknown { code: 0, event_type_code: 0 } // Placeholder codes
+                }
             },
         }
     }
@@ -64,8 +68,17 @@ enum RdevThreadMessage {
     Event(RdevEvent),
     Error(String),
     Started { width: u32, height: u32 },
-    Stopped,
+    // Stopped, // Removed as it's not currently used and causes a dead_code warning
 }
+
+// --- New messages for Connection Thread ---
+#[derive(Debug)]
+enum ConnectionThreadMessage {
+    Connected(TcpStream),
+    ConnectionFailed(String),
+    Disconnected,
+}
+// --- End Connection Thread Messages ---
 
 struct MyApp {
     value: i32, // Placeholder
@@ -89,6 +102,12 @@ struct MyApp {
     peer_address_input: String, // For IP or future Peer ID
     connection_status: String, // e.g., Disconnected, Connecting, Connected to <Peer>
     is_connected: bool, // Simple flag for now
+
+    // New fields for TCP connection management
+    tcp_stream: Option<TcpStream>,
+    connection_thread_handle: Option<JoinHandle<()>>,
+    // No specific sender needed TO the connection thread yet, it's fire-and-forget to connect.
+    connection_gui_rx: Option<Receiver<ConnectionThreadMessage>>,
 }
 
 impl Default for MyApp {
@@ -115,6 +134,9 @@ impl Default for MyApp {
             peer_address_input: String::new(),
             connection_status: "Disconnected".to_string(),
             is_connected: false,
+            tcp_stream: None,
+            connection_thread_handle: None,
+            connection_gui_rx: None,
         }
     }
 }
@@ -183,12 +205,38 @@ impl eframe::App for MyApp {
                         self.screen_height = height;
                         self.last_event_summary = format!("Screen: {}x{}", width, height); // Update summary
                     }
-                    RdevThreadMessage::Stopped => {
-                        self.listener_status = "Listener stopped.".to_string();
-                         if self.rdev_listener_handle.is_some() {
-                            self.rdev_listener_handle.take().unwrap().join().ok(); // Join the thread
+                    // RdevThreadMessage::Stopped was here
+                }
+            }
+        }
+
+        // Check for messages from the Connection thread
+        if let Some(rx) = &self.connection_gui_rx {
+            while let Ok(message) = rx.try_recv() {
+                match message {
+                    ConnectionThreadMessage::Connected(stream) => {
+                        self.tcp_stream = Some(stream);
+                        self.is_connected = true;
+                        self.connection_status = format!("Successfully connected to {}", self.peer_address_input);
+                        println!("TCP Connection established with: {}", self.peer_address_input);
+                        if let Some(handle) = self.connection_thread_handle.take() {
+                            handle.join().expect("Connection thread failed to join");
                         }
-                        self.rdev_thread_tx = None;
+                    }
+                    ConnectionThreadMessage::ConnectionFailed(err_msg) => {
+                        self.is_connected = false;
+                        self.connection_status = format!("Connection failed: {}", err_msg);
+                        eprintln!("TCP Connection failed: {}", err_msg);
+                        if let Some(handle) = self.connection_thread_handle.take() {
+                            handle.join().expect("Connection thread failed to join (after error)");
+                        }
+                    }
+                    ConnectionThreadMessage::Disconnected => {
+                        self.is_connected = false;
+                        self.tcp_stream = None; // Ensure stream is cleared
+                        self.connection_status = "Disconnected by peer or error during operation.".to_string();
+                        println!("TCP Disconnected (message from hypothetical read/write thread).");
+                        // In future, if a read/write thread signals this, we might also join its handle here.
                     }
                 }
             }
@@ -359,27 +407,58 @@ impl eframe::App for MyApp {
             ui.separator();
             ui.label("Connect to Peer:");
             ui.horizontal(|ui| {
-                ui.label("Peer Address/ID:");
-                ui.text_edit_singleline(&mut self.peer_address_input);
+                ui.label("Peer Address/ID (e.g., 127.0.0.1:7878):");
+                ui.add_enabled(!self.is_connected && self.connection_thread_handle.is_none(), 
+                    egui::TextEdit::singleline(&mut self.peer_address_input)
+                );
             });
-            if !self.is_connected {
+
+            if self.connection_thread_handle.is_some() {
+                ui.label("Processing connection attempt...");
+            } else if !self.is_connected {
                 if ui.button("Connect").clicked() {
-                    // TODO: Implement actual connection logic
                     if !self.peer_address_input.is_empty() {
                         self.connection_status = format!("Attempting to connect to {}...", self.peer_address_input);
-                        // Simulate connection for now
-                        self.is_connected = true; 
-                        self.connection_status = format!("Connected to {}", self.peer_address_input);
+                        let (conn_tx, conn_rx) = channel::<ConnectionThreadMessage>();
+                        self.connection_gui_rx = Some(conn_rx);
+                        let peer_addr_clone = self.peer_address_input.clone();
+                        
+                        let handle = thread::spawn(move || {
+                            println!("Connection thread: Attempting to connect to {}", peer_addr_clone);
+                            match TcpStream::connect(&peer_addr_clone) {
+                                Ok(stream) => {
+                                    println!("Connection thread: Successfully connected to {}", peer_addr_clone);
+                                    // Set non-blocking or timeouts for the stream if needed for later operations
+                                    // stream.set_nonblocking(true).expect("set_nonblocking call failed");
+                                    conn_tx.send(ConnectionThreadMessage::Connected(stream)).unwrap_or_default();
+                                }
+                                Err(e) => {
+                                    eprintln!("Connection thread: Failed to connect to {}: {}", peer_addr_clone, e);
+                                    conn_tx.send(ConnectionThreadMessage::ConnectionFailed(e.to_string())).unwrap_or_default();
+                                }
+                            }
+                        });
+                        self.connection_thread_handle = Some(handle);
                     } else {
                         self.connection_status = "Error: Peer address is empty.".to_string();
                     }
                 }
-            } else {
+            } else { // is_connected
                 if ui.button("Disconnect").clicked() {
-                    // TODO: Implement actual disconnection logic
+                    if let Some(stream) = self.tcp_stream.take() {
+                        println!("Disconnecting from peer...");
+                        if let Err(e) = stream.shutdown(std::net::Shutdown::Both) {
+                            eprintln!("Error shutting down TCP stream: {}", e);
+                        }
+                        // The stream is dropped here, closing the connection.
+                    }
                     self.is_connected = false;
                     self.connection_status = "Disconnected".to_string();
-                    self.peer_address_input.clear(); // Optionally clear input on disconnect
+                    // self.peer_address_input.clear(); // Optionally clear input on disconnect
+                    // If a connection thread was somehow still around (shouldn't be if connected), handle it.
+                    if let Some(handle) = self.connection_thread_handle.take() {
+                        handle.join().expect("Connection thread (during disconnect) failed to join");
+                    }
                 }
             }
             ui.label(format!("Connection Status: {}", self.connection_status));
@@ -388,7 +467,7 @@ impl eframe::App for MyApp {
         });
 
         // Request a repaint if the listener might be active, to process messages
-        if self.rdev_listener_handle.is_some() {
+        if self.rdev_listener_handle.is_some() || self.connection_thread_handle.is_some() {
             ctx.request_repaint();
         }
     }
