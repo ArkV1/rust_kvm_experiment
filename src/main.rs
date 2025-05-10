@@ -6,6 +6,7 @@ use std::thread::{self, JoinHandle};
 // (These were previously commented out at the bottom or in a different scope)
 use rdev::{listen, Event as RdevEvent, EventType as RdevEventType, Key as RdevKey, Button as RdevButton};
 use serde::{Serialize, Deserialize};
+use local_ip_address::local_ip; // Added for local IP
 
 // --- Network Message Definitions ---
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -84,6 +85,7 @@ struct MyApp {
     edge_status: String,
 
     // New fields for networking placeholder
+    my_local_ip: String, // To display own IP
     peer_address_input: String, // For IP or future Peer ID
     connection_status: String, // e.g., Disconnected, Connecting, Connected to <Peer>
     is_connected: bool, // Simple flag for now
@@ -91,6 +93,11 @@ struct MyApp {
 
 impl Default for MyApp {
     fn default() -> Self {
+        let local_ip_string = match local_ip() {
+            Ok(ip) => ip.to_string(),
+            Err(e) => format!("Error getting local IP: {}", e),
+        };
+
         Self {
             value: 0,
             macos_accessibility_granted: None,
@@ -104,6 +111,7 @@ impl Default for MyApp {
             current_mouse_x: 0.0,
             current_mouse_y: 0.0,
             edge_status: "Mouse not at edge".to_string(),
+            my_local_ip: local_ip_string, // Initialize with local IP
             peer_address_input: String::new(),
             connection_status: "Disconnected".to_string(),
             is_connected: false,
@@ -338,7 +346,18 @@ impl eframe::App for MyApp {
 
             // --- Networking UI Placeholder ---
             ui.separator();
-            ui.heading("Networking (Placeholder)");
+            ui.heading("Networking");
+
+            ui.label("My Connection Details:");
+            ui.horizontal(|ui| {
+                ui.label("Local IP Address:");
+                // Make the IP address selectable so the user can copy it
+                let mut ip_to_show = self.my_local_ip.clone();
+                ui.add(egui::TextEdit::singleline(&mut ip_to_show).interactive(false));
+            });
+            
+            ui.separator();
+            ui.label("Connect to Peer:");
             ui.horizontal(|ui| {
                 ui.label("Peer Address/ID:");
                 ui.text_edit_singleline(&mut self.peer_address_input);
