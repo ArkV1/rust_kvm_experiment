@@ -6,7 +6,7 @@ use std::net::TcpStream; // Added for TCP connection
 
 // Import rdev types needed for the listener functionality
 // (These were previously commented out at the bottom or in a different scope)
-use rdev::{listen, Event as RdevEvent, EventType as RdevEventType, Key as RdevKey, Button as RdevButton};
+use rdev::{Event as RdevEvent, EventType as RdevEventType, Key as RdevKey, Button as RdevButton};
 use serde::{Serialize, Deserialize};
 use local_ip_address::local_ip; // Added for local IP
 
@@ -69,7 +69,6 @@ enum RdevThreadMessage {
     Event(RdevEvent),
     Error(String),
     Started { width: u32, height: u32 },
-    Stopped,
 }
 
 // Helper function to check for Wayland environment
@@ -149,9 +148,8 @@ impl Default for MyApp {
 
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Check for messages from the rdev thread on each UI update
+        // Check for messages from the rdev thread
         if let Some(rx) = &self.rdev_gui_rx {
-            // Use try_recv for non-blocking check
             while let Ok(message) = rx.try_recv() {
                 match message {
                     RdevThreadMessage::Event(event) => {
@@ -211,7 +209,6 @@ impl eframe::App for MyApp {
                         self.screen_height = height;
                         self.last_event_summary = format!("Screen: {}x{}", width, height); // Update summary
                     }
-                    // RdevThreadMessage::Stopped was here
                 }
             }
         }
@@ -318,76 +315,35 @@ impl eframe::App for MyApp {
                 if ui.button("Start Listener").clicked() {
                     let (gui_tx, gui_rx) = channel::<RdevThreadMessage>();
                     self.rdev_gui_rx = Some(gui_rx);
-                    
                     let thread_gui_tx_for_spawn = gui_tx.clone();
-                    let use_grab = is_running_on_wayland();
-
-                    if use_grab {
-                        self.listener_status = "Starting listener (Wayland mode using grab)...".to_string();
-                        println!("Attempting to start rdev listener in Wayland (grab) mode.");
-                    } else {
-                        self.listener_status = "Starting listener (X11 mode using listen)...".to_string();
-                        println!("Attempting to start rdev listener in X11 (listen) mode.");
-                    }
+                    self.listener_status = "Starting listener...".to_string();
                     self.last_event_summary = "Waiting for events...".to_string();
-
                     let handle = thread::spawn(move || {
-                        let event_tx = thread_gui_tx_for_spawn.clone(); // For events
-                        let status_tx = thread_gui_tx_for_spawn;      // For Started and Error/Stopped
-
-                        // Get display size
-                        let (screen_width, screen_height) = match rdev::display_size() {
-                            Ok((w, h)) => (w, h),
+                        let event_tx = thread_gui_tx_for_spawn.clone(); 
+                        let status_tx = thread_gui_tx_for_spawn;
+                        println!("rdev listener thread started.");
+                        match rdev::display_size() {
+                            Ok((w, h)) => {
+                                status_tx.send(RdevThreadMessage::Started { width: w as u32, height: h as u32 }).unwrap_or_default();
+                            }
                             Err(e) => {
-                                let err_msg = format!("Failed to get display size: {:?}. Edge detection will be unreliable.", e);
+                                let err_msg = format!("Failed to get display size: {:?}", e);
                                 eprintln!("{}", err_msg);
-                                // Send an error, but we might still try to start the listener without screen info
-                                // or with (0,0) which would make edge detection not work.
-                                // For now, let's send the error and stop the thread to make it clear.
                                 status_tx.send(RdevThreadMessage::Error(err_msg)).unwrap_or_default();
-                                return;
+                                return; 
                             }
-                        };
-                        // Send Started message with actual dimensions
-                        status_tx.send(RdevThreadMessage::Started { width: screen_width as u32, height: screen_height as u32 }).unwrap_or_default();
-
-                        if use_grab {
-                            // Wayland: Use rdev::grab()
-                            println!("rdev listener thread: Using GRAB (Wayland mode).");
-                            let grab_callback = move |event: RdevEvent| -> Option<RdevEvent> {
-                                if event_tx.send(RdevThreadMessage::Event(event.clone())).is_err() {
-                                    println!("rdev (grab): GUI channel closed, can't send event. Listener continues.");
-                                    // To stop grab, the thread would need a signal to terminate itself.
-                                    // For now, if channel is closed, events are just dropped by the send.
-                                }
-                                Some(event) // Pass the event through
-                            };
-                            if let Err(error) = rdev::grab(grab_callback) {
-                                let error_msg = format!(
-                                    "Wayland Listener (grab) error: {:?}. Ensure correct permissions (e.g., user in 'input' group or run as root).",
-                                    error
-                                );
-                                eprintln!("rdev grab error: {}", error_msg);
-                                status_tx.send(RdevThreadMessage::Error(error_msg)).unwrap_or_default();
-                            } else {
-                                println!("rdev grab finished without an explicit error.");
-                                status_tx.send(RdevThreadMessage::Stopped).unwrap_or_default();
+                        }
+                        
+                        if let Err(error) = rdev::listen(move |event| {
+                            if event_tx.send(RdevThreadMessage::Event(event)).is_err() {
+                                println!("rdev: GUI channel closed, can't send event. Listener continues until error.");
                             }
+                        }) {
+                            eprintln!("rdev listener error: {:?}", error);
+                            status_tx.send(RdevThreadMessage::Error(format!("{:?}", error))).unwrap_or_default();
                         } else {
-                            // X11: Use rdev::listen()
-                            println!("rdev listener thread: Using LISTEN (X11 mode).");
-                            if let Err(error) = rdev::listen(move |event| {
-                                if event_tx.send(RdevThreadMessage::Event(event)).is_err() {
-                                    println!("rdev (listen): GUI channel closed, can't send event. Listener continues.");
-                                }
-                            }) {
-                                let error_msg = format!("X11 Listener (listen) error: {:?}", error);
-                                eprintln!("rdev listen error: {}", error_msg);
-                                status_tx.send(RdevThreadMessage::Error(error_msg)).unwrap_or_default();
-                            } else {
-                                println!("rdev listen finished without an explicit error.");
-                                status_tx.send(RdevThreadMessage::Stopped).unwrap_or_default();
-                            }
+                            println!("rdev listener finished without an explicit error (unexpected).");
+                            // Ensuring no RdevThreadMessage::Stopped is sent here.
                         }
                     });
                     self.rdev_listener_handle = Some(handle);
