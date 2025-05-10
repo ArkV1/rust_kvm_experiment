@@ -6,7 +6,7 @@ use std::net::TcpStream; // Added for TCP connection
 
 // Import rdev types needed for the listener functionality
 // (These were previously commented out at the bottom or in a different scope)
-use rdev::{listen, Event as RdevEvent, EventType as RdevEventType, Key as RdevKey, Button as RdevButton};
+use rdev::{Event as RdevEvent, EventType as RdevEventType, Key as RdevKey, Button as RdevButton};
 use serde::{Serialize, Deserialize};
 use local_ip_address::local_ip; // Added for local IP
 
@@ -69,7 +69,8 @@ enum RdevThreadMessage {
     Event(RdevEvent),
     Error(String),
     Started { width: u32, height: u32 },
-    Stopped,
+    // NOTE: Assuming 'Stopped' variant was intentionally removed in origin/master based on conflict pattern.
+    // If 'Stopped' is needed, it should be re-added here and handled in the match below.
 }
 
 // Helper function to check for Wayland environment
@@ -149,9 +150,8 @@ impl Default for MyApp {
 
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Check for messages from the rdev thread on each UI update
+        // Check for messages from the rdev thread
         if let Some(rx) = &self.rdev_gui_rx {
-            // Use try_recv for non-blocking check
             while let Ok(message) = rx.try_recv() {
                 match message {
                     RdevThreadMessage::Event(event) => {
@@ -211,13 +211,7 @@ impl eframe::App for MyApp {
                         self.screen_height = height;
                         self.last_event_summary = format!("Screen: {}x{}", width, height); // Update summary
                     }
-                    RdevThreadMessage::Stopped => {
-                        self.listener_status = "Listener stopped.".to_string();
-                        if let Some(handle) = self.rdev_listener_handle.take() {
-                            handle.join().ok(); // Join the thread
-                        }
-                        self.rdev_thread_tx = None; // Clear sender as thread is likely gone or stopping
-                    }
+                    // Removed RdevThreadMessage::Stopped arm as the variant is assumed to be removed from origin/master
                 }
             }
         }
@@ -270,17 +264,17 @@ impl eframe::App for MyApp {
                     // For a real check, we'd try a minimal rdev operation here
                     // or use a specific macOS API if available.
                     // This is a placeholder for the actual check logic.
-                    // Let\'s simulate a check for now.
+                    // Let's simulate a check for now.
                     // In a real scenario, this might involve trying to rdev::listen
                     // in a non-blocking way or using another method.
-                    // For now, we'll assume we need to guide the user if it\'s the first run or unknown.
+                    // For now, we'll assume we need to guide the user if it's the first run or unknown.
                     ui.label("Checking macOS Accessibility permissions...");
                     // Placeholder: In a real app, you'd call a function here that tries
                     // to use rdev or a macOS API to determine status.
-                    // For this example, let\'s just pretend it becomes false if not yet set.
+                    // For this example, let's just pretend it becomes false if not yet set.
                     // self.macos_accessibility_granted = Some(check_macos_accessibility());
                     // We'll manually set it for demonstration purposes in a real scenario.
-                    // For now, let\'s just show the message.
+                    // For now, let's just show the message.
                 }
 
                 match self.macos_accessibility_granted {
@@ -326,45 +320,39 @@ impl eframe::App for MyApp {
                     self.rdev_gui_rx = Some(gui_rx);
                     
                     let thread_gui_tx_for_spawn = gui_tx.clone();
-                    let use_grab = is_running_on_wayland();
+                    let use_grab = is_running_on_wayland(); // Retain Wayland detection from HEAD
 
-                    if use_grab {
+                    if use_grab { // Wayland-specific status message from HEAD
                         self.listener_status = "Starting listener (Wayland mode using grab)...".to_string();
                         println!("Attempting to start rdev listener in Wayland (grab) mode.");
-                    } else {
+                    } else { // X11 status message from HEAD
                         self.listener_status = "Starting listener (X11 mode using listen)...".to_string();
                         println!("Attempting to start rdev listener in X11 (listen) mode.");
                     }
-                    self.last_event_summary = "Waiting for events...".to_string();
+                    self.last_event_summary = "Waiting for events...".to_string(); // Common
 
                     let handle = thread::spawn(move || {
-                        let event_tx = thread_gui_tx_for_spawn.clone(); // For events
-                        let status_tx = thread_gui_tx_for_spawn;      // For Started and Error/Stopped
-
-                        // Get display size
+                        let event_tx = thread_gui_tx_for_spawn.clone(); 
+                        let status_tx = thread_gui_tx_for_spawn;
+                        
+                        // Get display size - this logic is from HEAD and seems beneficial
                         let (screen_width, screen_height) = match rdev::display_size() {
                             Ok((w, h)) => (w, h),
                             Err(e) => {
                                 let err_msg = format!("Failed to get display size: {:?}. Edge detection will be unreliable.", e);
                                 eprintln!("{}", err_msg);
-                                // Send an error, but we might still try to start the listener without screen info
-                                // or with (0,0) which would make edge detection not work.
-                                // For now, let's send the error and stop the thread to make it clear.
                                 status_tx.send(RdevThreadMessage::Error(err_msg)).unwrap_or_default();
-                                return;
+                                return; 
                             }
                         };
-                        // Send Started message with actual dimensions
+                        // Send Started message with actual dimensions - from HEAD
                         status_tx.send(RdevThreadMessage::Started { width: screen_width as u32, height: screen_height as u32 }).unwrap_or_default();
 
-                        if use_grab {
-                            // Wayland: Use rdev::grab()
+                        if use_grab { // Wayland path from HEAD
                             println!("rdev listener thread: Using GRAB (Wayland mode).");
                             let grab_callback = move |event: RdevEvent| -> Option<RdevEvent> {
                                 if event_tx.send(RdevThreadMessage::Event(event.clone())).is_err() {
                                     println!("rdev (grab): GUI channel closed, can't send event. Listener continues.");
-                                    // To stop grab, the thread would need a signal to terminate itself.
-                                    // For now, if channel is closed, events are just dropped by the send.
                                 }
                                 Some(event) // Pass the event through
                             };
@@ -377,22 +365,22 @@ impl eframe::App for MyApp {
                                 status_tx.send(RdevThreadMessage::Error(error_msg)).unwrap_or_default();
                             } else {
                                 println!("rdev grab finished without an explicit error.");
-                                status_tx.send(RdevThreadMessage::Stopped).unwrap_or_default();
+                                // If RdevThreadMessage::Stopped is not part of the merged enum, don't send it.
+                                // status_tx.send(RdevThreadMessage::Stopped).unwrap_or_default(); // Keep this commented/removed
                             }
-                        } else {
-                            // X11: Use rdev::listen()
+                        } else { // X11 path from HEAD (which is similar to origin/master's listen but better structured)
                             println!("rdev listener thread: Using LISTEN (X11 mode).");
-                            if let Err(error) = rdev::listen(move |event| {
+                            if let Err(error) = rdev::listen(move |event| { // rdev::listen is from HEAD
                                 if event_tx.send(RdevThreadMessage::Event(event)).is_err() {
                                     println!("rdev (listen): GUI channel closed, can't send event. Listener continues.");
                                 }
                             }) {
-                                let error_msg = format!("X11 Listener (listen) error: {:?}", error);
+                                let error_msg = format!("X11 Listener (listen) error: {:?}", error); // Error formatting from HEAD
                                 eprintln!("rdev listen error: {}", error_msg);
                                 status_tx.send(RdevThreadMessage::Error(error_msg)).unwrap_or_default();
                             } else {
-                                println!("rdev listen finished without an explicit error.");
-                                status_tx.send(RdevThreadMessage::Stopped).unwrap_or_default();
+                                println!("rdev listen finished without an explicit error (unexpected).");
+                                // No RdevThreadMessage::Stopped sent here either, consistent with origin/master's simpler listen path.
                             }
                         }
                     });
@@ -558,8 +546,8 @@ fn main() -> Result<(), eframe::Error> {
 //     //         // Check error type for permission denied
 //     //         // This is difficult because listen is blocking and designed to run for a long time.
 //     //         // return false;
-//     //     }
-//     //     // return true; if it didn't error in a way that indicates denial
+//     }
+//     // return true; if it didn't error in a way that indicates denial
 //     // }).join().unwrap_or(false)
 //     //
 //     // A better approach for macOS might be to use the `IOKit` or other system frameworks
