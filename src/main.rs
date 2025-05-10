@@ -211,7 +211,13 @@ impl eframe::App for MyApp {
                         self.screen_height = height;
                         self.last_event_summary = format!("Screen: {}x{}", width, height); // Update summary
                     }
-                    // RdevThreadMessage::Stopped was here
+                    RdevThreadMessage::Stopped => {
+                        self.listener_status = "Listener stopped.".to_string();
+                        if let Some(handle) = self.rdev_listener_handle.take() {
+                            handle.join().ok(); // Join the thread
+                        }
+                        self.rdev_thread_tx = None; // Clear sender as thread is likely gone or stopping
+                    }
                 }
             }
         }
@@ -364,7 +370,7 @@ impl eframe::App for MyApp {
                             };
                             if let Err(error) = rdev::grab(grab_callback) {
                                 let error_msg = format!(
-                                    "Wayland Listener (grab) error: {:?}. Ensure correct permissions (e.g., user in 'input' group or run as root).",
+                                    "Wayland Listener (grab) error: {:?}.\n\nThis can happen if an input device (e.g., /dev/input/eventX) has restrictive permissions that prevent access even if you are in the 'input' group. Some systems have special hardware keys (like vendor-specific function keys) that remain root-only.\n\nEnsure you are a member of the 'input' group (or 'plugdev' on some systems) and have restarted your session. If the issue persists, a specific input device might be the cause. Running 'ls -l /dev/input/' might help identify such devices (look for ones not belonging to the 'input' group or with restrictive ACLs).",
                                     error
                                 );
                                 eprintln!("rdev grab error: {}", error_msg);
@@ -473,16 +479,21 @@ impl eframe::App for MyApp {
                         let peer_addr_clone = self.peer_address_input.clone();
                         
                         let handle = thread::spawn(move || {
-                            println!("Connection thread: Attempting to connect to {}", peer_addr_clone);
-                            match TcpStream::connect(&peer_addr_clone) {
+                            let mut addr_to_connect = peer_addr_clone.clone(); // Clone again for modification
+                            if !addr_to_connect.contains(':') {
+                                let default_port = 7878;
+                                println!("Port not specified for {}, appending default port {}.", addr_to_connect, default_port);
+                                addr_to_connect = format!("{}:{}", addr_to_connect, default_port);
+                            }
+
+                            println!("Connection thread: Attempting to connect to {}", addr_to_connect);
+                            match TcpStream::connect(&addr_to_connect) {
                                 Ok(stream) => {
-                                    println!("Connection thread: Successfully connected to {}", peer_addr_clone);
-                                    // Set non-blocking or timeouts for the stream if needed for later operations
-                                    // stream.set_nonblocking(true).expect("set_nonblocking call failed");
+                                    println!("Connection thread: Successfully connected to {}", addr_to_connect);
                                     conn_tx.send(ConnectionThreadMessage::Connected(stream)).unwrap_or_default();
                                 }
                                 Err(e) => {
-                                    eprintln!("Connection thread: Failed to connect to {}: {}", peer_addr_clone, e);
+                                    eprintln!("Connection thread: Failed to connect to {}: {}", addr_to_connect, e);
                                     conn_tx.send(ConnectionThreadMessage::ConnectionFailed(e.to_string())).unwrap_or_default();
                                 }
                             }
