@@ -358,7 +358,7 @@ impl eframe::App for MyApp {
                             };
                             if let Err(error) = rdev::grab(grab_callback) {
                                 let error_msg = format!(
-                                    "Wayland Listener (grab) error: {:?}.\n\nThis can happen if an input device (e.g., /dev/input/eventX) has restrictive permissions that prevent access even if you are in the 'input' group. Some systems have special hardware keys (like vendor-specific function keys) that remain root-only.\n\nEnsure you are a member of the 'input' group (or 'plugdev' on some systems) and have restarted your session. If the issue persists, a specific input device might be the cause. Running 'ls -l /dev/input/' might help identify such devices (look for ones not belonging to the 'input' group or with restrictive ACLs).",
+                                    "Wayland Listener (grab) error: {:?}.\n\nTo fix this (on Linux), the process needs to run as a user who is a member of the 'input' group (recommended). On some distros, the group might be 'plugdev'. If in doubt, add your user to both groups if they exist and restart your session. Alternatively, running as root (not recommended) might work.",
                                     error
                                 );
                                 eprintln!("rdev grab error: {}", error_msg);
@@ -378,7 +378,7 @@ impl eframe::App for MyApp {
                                 let error_msg = format!("X11 Listener (listen) error: {:?}", error); // Error formatting from HEAD
                                 eprintln!("rdev listen error: {}", error_msg);
                                 status_tx.send(RdevThreadMessage::Error(error_msg)).unwrap_or_default();
-                            } else {
+                        } else {
                                 println!("rdev listen finished without an explicit error (unexpected).");
                                 // No RdevThreadMessage::Stopped sent here either, consistent with origin/master's simpler listen path.
                             }
