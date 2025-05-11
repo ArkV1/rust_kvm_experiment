@@ -1,3 +1,10 @@
+mod event_handling;
+mod network_client;
+mod network_server;
+mod gui;
+mod macos_utils;
+mod constants;
+
 use eframe::egui;
 use std::sync::mpsc::{channel, Sender, Receiver};
 use std::thread::{self, JoinHandle};
@@ -11,93 +18,25 @@ use rdev::{Event as RdevEvent, EventType as RdevEventType, Key as RdevKey, Butto
 use serde::{Serialize, Deserialize};
 use local_ip_address::local_ip; // Added for local IP
 
+use crate::event_handling::{NetworkKvmMessage, SerializableRdevEvent, SerializableRdevEventType, RdevThreadMessage, is_running_on_wayland, spawn_rdev_listener_thread};
+use crate::network_client::{ConnectionThreadMessage, spawn_connect_thread};
+use crate::network_server::{ServerThreadMessage, spawn_listener_thread};
+use crate::constants::DEFAULT_PORT; // Assuming DEFAULT_PORT is used from constants
+use crate::macos_utils::check_and_display_macos_accessibility; // Added
+use crate::gui::{draw_header_panel, draw_input_listener_panel, draw_mouse_screen_info_panel, draw_networking_panel}; // Added draw_header_panel
+
 // --- Network Message Definitions ---
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub enum NetworkKvmMessage {
-    Heartbeat,
-    Event(SerializableRdevEvent),
-    // We might add other message types later, e.g., ClipboardData, ConfigSync
-}
-
-// rdev::Event itself is not directly Serialize/Deserialize friendly due to nested types
-// that might not implement it or are platform specific in ways serde struggles with easily.
-// We create a simplified, serializable version.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct SerializableRdevEvent {
-    // pub time: SystemTime, // SystemTime can be tricky to serialize consistently across platforms/serde formats.
-                           // We might add a timestamp later if needed, perhaps as u64 millis.
-    pub name: Option<String>, // Corresponds to rdev::Event.name
-    pub event_type: SerializableRdevEventType, // Corresponds to rdev::Event.event_type
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)] pub enum SerializableRdevEventType {
-    KeyPress(RdevKey),
-    KeyRelease(RdevKey),
-    ButtonPress(RdevButton),
-    ButtonRelease(RdevButton),
-    MouseMove { x: f64, y: f64 },
-    Wheel { delta_x: i64, delta_y: i64 },
-    Unknown { code: u32, event_type_code: u16 }, // Represents an event we couldn't specifically map
-}
-
-// Helper to convert from rdev::Event to SerializableRdevEvent
-impl From<RdevEvent> for SerializableRdevEvent {
-    fn from(event: RdevEvent) -> Self {
-        SerializableRdevEvent {
-            name: event.name,
-            event_type: match event.event_type {
-                RdevEventType::KeyPress(k) => SerializableRdevEventType::KeyPress(k),
-                RdevEventType::KeyRelease(k) => SerializableRdevEventType::KeyRelease(k),
-                RdevEventType::ButtonPress(b) => SerializableRdevEventType::ButtonPress(b),
-                RdevEventType::ButtonRelease(b) => SerializableRdevEventType::ButtonRelease(b),
-                RdevEventType::MouseMove { x, y } => SerializableRdevEventType::MouseMove { x, y },
-                RdevEventType::Wheel { delta_x, delta_y } => SerializableRdevEventType::Wheel { delta_x, delta_y },
-                // RdevEventType::Unknown is not a variant with {code, event_type}. 
-                // We catch all other rdev event types here.
-                other => {
-                    println!("Warning: Unhandled rdev::EventType {:?}. Mapping to generic Unknown.", other);
-                    SerializableRdevEventType::Unknown { code: 0, event_type_code: 0 } // Placeholder codes
-                }
-            },
-        }
-    }
-}
+// pub enum NetworkKvmMessage { ... }
+// pub struct SerializableRdevEvent { ... }
+// pub enum SerializableRdevEventType { ... }
+// impl From<RdevEvent> for SerializableRdevEvent { ... }
 // --- End Network Message Definitions ---
 
 // Define a message type to send from the rdev thread to the GUI thread
-#[derive(Debug)]
-enum RdevThreadMessage {
-    Event(RdevEvent),
-    Error(String),
-    Started { width: u32, height: u32 },
-    // NOTE: Assuming 'Stopped' variant was intentionally removed in origin/master based on conflict pattern.
-    // If 'Stopped' is needed, it should be re-added here and handled in the match below.
-}
+// enum RdevThreadMessage { ... }
 
 // Helper function to check for Wayland environment
-fn is_running_on_wayland() -> bool {
-    env::var("WAYLAND_DISPLAY").is_ok() || env::var("XDG_SESSION_TYPE").map_or(false, |s| s.eq_ignore_ascii_case("wayland"))
-}
-
-// --- New messages for Connection Thread ---
-#[derive(Debug)]
-enum ConnectionThreadMessage {
-    Connected(TcpStream),
-    ConnectionFailed(String),
-    Disconnected,
-}
-// --- End Connection Thread Messages ---
-
-// --- New messages for Server Listener Thread ---
-#[derive(Debug)]
-enum ServerThreadMessage {
-    Listening(SocketAddr),
-    NewConnection(TcpStream, SocketAddr), // Carries the new stream and the peer's address
-    BindError(String),
-    AcceptError(String),
-    // We might add ListenerStopped if we make stop more graceful
-}
-// --- End Server Listener Thread Messages ---
+// fn is_running_on_wayland() -> bool { ... }
 
 struct MyApp {
     value: i32, // Placeholder
@@ -229,11 +168,14 @@ impl eframe::App for MyApp {
                         if let RdevEventType::MouseMove { x, y } = event.event_type {
                             self.current_mouse_x = x;
                             self.current_mouse_y = y;
-                            if self.screen_width > 0 && self.screen_height > 0 { 
+
+                            if self.screen_width > 0 && self.screen_height > 0 {
+                                // Reverted to direct comparison with screen_width/height and a small buffer
                                 let at_left = x <= 1.0;
-                                let at_right = x >= (self.screen_width as f64 - 2.0); 
+                                let at_right = x >= (self.screen_width as f64 - 2.0);
                                 let at_top = y <= 1.0;
                                 let at_bottom = y >= (self.screen_height as f64 - 2.0);
+
                                 if at_left {
                                     self.edge_status = "Mouse at LEFT edge".to_string();
                                 } else if at_right {
@@ -340,324 +282,46 @@ impl eframe::App for MyApp {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Rust KVM Experiment");
-            ui.horizontal(|ui| {
-                ui.label("Placeholder value:");
-                ui.add(egui::DragValue::new(&mut self.value));
-            });
-
+            draw_header_panel(ui, &mut self.value);
             ui.separator();
 
-            // macOS Accessibility Check
-            if cfg!(target_os = "macos") {
-                if self.macos_accessibility_granted.is_none() {
-                    // Attempt a check if unknown.
-                    // For a real check, we'd try a minimal rdev operation here
-                    // or use a specific macOS API if available.
-                    // This is a placeholder for the actual check logic.
-                    // Let's simulate a check for now.
-                    // In a real scenario, this might involve trying to rdev::listen
-                    // in a non-blocking way or using another method.
-                    // For now, we'll assume we need to guide the user if it's the first run or unknown.
-                    ui.label("Checking macOS Accessibility permissions...");
-                    // Placeholder: In a real app, you'd call a function here that tries
-                    // to use rdev or a macOS API to determine status.
-                    // For this example, let's just pretend it becomes false if not yet set.
-                    // self.macos_accessibility_granted = Some(check_macos_accessibility());
-                    // We'll manually set it for demonstration purposes in a real scenario.
-                    // For now, let's just show the message.
-                }
-
-                match self.macos_accessibility_granted {
-                    Some(true) => {
-                        ui.colored_label(egui::Color32::GREEN, "macOS Accessibility permissions appear to be granted.");
-                    }
-                    Some(false) => {
-                        ui.colored_label(egui::Color32::RED, "macOS Accessibility permissions are NOT granted.");
-                        ui.label("To use this application fully, please grant Accessibility access.");
-                        ui.label("Go to System Settings > Privacy & Security > Accessibility.");
-                        ui.label("Click the '+' button, find this application (or your terminal if running via 'cargo run'), and enable it.");
-                        if ui.button("Open Accessibility Settings").clicked() {
-                            // Try to open the settings pane
-                            // This is platform-specific and might need a crate or direct OS calls.
-                            // For macOS:
-                            let _ = std::process::Command::new("open")
-                                .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
-                                .status();
-                        }
-                    }
-                    None => {
-                         // Still unknown, show a button to manually trigger a "check" or guide
-                        ui.label("macOS Accessibility permission status is unknown.");
-                        ui.label("Please ensure permissions are granted as per instructions above.");
-                         if ui.button("Re-check Accessibility (Simulated - Set to Denied for Demo)").clicked() {
-                            self.macos_accessibility_granted = Some(false); // Simulate finding it's denied
-                        }
-                        if ui.button("Simulate Permission Granted").clicked() {
-                            self.macos_accessibility_granted = Some(true);
-                        }
-                    }
-                }
-            } else {
-                ui.label("Not on macOS, no specific accessibility permission check needed here.");
-            }
-
+            check_and_display_macos_accessibility(&mut self.macos_accessibility_granted, ui);
             ui.separator();
-            ui.heading("Input Event Listener Control");
 
-            if self.rdev_listener_handle.is_none() { // If listener is not running
-                if ui.button("Start Input Listener").clicked() {
-                    let (gui_tx, gui_rx) = channel::<RdevThreadMessage>();
-                    self.rdev_gui_rx = Some(gui_rx);
-                    
-                    let thread_gui_tx_for_spawn = gui_tx.clone();
-                    let use_grab = is_running_on_wayland(); // Retain Wayland detection from HEAD
-
-                    if use_grab { // Wayland-specific status message from HEAD
-                        self.input_listener_status = "Starting listener (Wayland mode using grab)...".to_string();
-                        println!("Attempting to start rdev listener in Wayland (grab) mode.");
-                    } else { // X11 status message from HEAD
-                        self.input_listener_status = "Starting listener (X11 mode using listen)...".to_string();
-                        println!("Attempting to start rdev listener in X11 (listen) mode.");
-                    }
-                    self.last_event_summary = "Waiting for events...".to_string(); // Common
-
-                    let handle = thread::spawn(move || {
-                        let event_tx = thread_gui_tx_for_spawn.clone(); 
-                        let status_tx = thread_gui_tx_for_spawn;
-                        
-                        // Get display size - this logic is from HEAD and seems beneficial
-                        let (screen_width, screen_height) = match rdev::display_size() {
-                            Ok((w, h)) => (w, h),
-                            Err(e) => {
-                                let err_msg = format!("Failed to get display size: {:?}. Edge detection will be unreliable.", e);
-                                eprintln!("{}", err_msg);
-                                status_tx.send(RdevThreadMessage::Error(err_msg)).unwrap_or_default();
-                                return; 
-                            }
-                        };
-                        // Send Started message with actual dimensions - from HEAD
-                        status_tx.send(RdevThreadMessage::Started { width: screen_width as u32, height: screen_height as u32 }).unwrap_or_default();
-
-                        if use_grab { // Wayland path from HEAD
-                            println!("rdev listener thread: Using GRAB (Wayland mode).");
-                            let grab_callback = move |event: RdevEvent| -> Option<RdevEvent> {
-                                if event_tx.send(RdevThreadMessage::Event(event.clone())).is_err() {
-                                    println!("rdev (grab): GUI channel closed, can't send event. Listener continues.");
-                                }
-                                Some(event) // Pass the event through
-                            };
-                            if let Err(error) = rdev::grab(grab_callback) {
-                                let error_msg = format!(
-                                    "Wayland Listener (grab) error: {:?}.\n\nTo fix this (on Linux), the process needs to run as a user who is a member of the 'input' group (recommended). On some distros, the group might be 'plugdev'. If in doubt, add your user to both groups if they exist and restart your session. Alternatively, running as root (not recommended) might work.",
-                                    error
-                                );
-                                eprintln!("rdev grab error: {}", error_msg);
-                                status_tx.send(RdevThreadMessage::Error(error_msg)).unwrap_or_default();
-                            } else {
-                                println!("rdev grab finished without an explicit error.");
-                            }
-                        } else { // X11 path from HEAD (which is similar to origin/master's listen but better structured)
-                            println!("rdev listener thread: Using LISTEN (X11 mode).");
-                            if let Err(error) = rdev::listen(move |event| { // rdev::listen is from HEAD
-                                if event_tx.send(RdevThreadMessage::Event(event)).is_err() {
-                                    println!("rdev (listen): GUI channel closed, can't send event. Listener continues.");
-                                }
-                            }) {
-                                let error_msg = format!("X11 Listener (listen) error: {:?}", error); // Error formatting from HEAD
-                                eprintln!("rdev listen error: {}", error_msg);
-                                status_tx.send(RdevThreadMessage::Error(error_msg)).unwrap_or_default();
-                        } else {
-                                println!("rdev listen finished without an explicit error (unexpected).");
-                            }
-                        }
-                    });
-                    self.rdev_listener_handle = Some(handle);
-                }
-            } else { // If listener IS running
-                if ui.button("Stop Input Listener").clicked() {
-                    println!("Stop Input Listener clicked.");
-                    self.input_listener_status = "Stop request sent (input listener).".to_string();
-                    if let Some(_handle) = self.rdev_listener_handle.take() {
-                        println!("Input Listener thread handle taken.");
-                    }
-                    self.rdev_thread_tx = None; 
-                    self.input_listener_status = "Input Listener abandoned by GUI.".to_string();
-                }
-            }
-
+            draw_input_listener_panel(
+                ui,
+                &mut self.rdev_listener_handle,
+                &mut self.input_listener_status,
+                &mut self.last_event_summary,
+                &mut self.rdev_gui_rx,
+                &mut self.rdev_thread_tx
+            );
             ui.separator();
-            ui.label(format!("Input Listener Status: {}", self.input_listener_status));
-            ui.label(format!("Last Event: {}", self.last_event_summary));
 
+            draw_mouse_screen_info_panel(
+                ui,
+                self.screen_width,
+                self.screen_height,
+                self.current_mouse_x,
+                self.current_mouse_y,
+                &self.edge_status
+            );
             ui.separator();
-            ui.heading("Mouse & Screen Info");
-            ui.label(format!("Screen Dimensions: {}x{}", self.screen_width, self.screen_height));
-            ui.label(format!("Mouse Position: ({:.0}, {:.0})", self.current_mouse_x, self.current_mouse_y));
-            ui.label(format!("Edge Status: {}", self.edge_status));
 
-            // --- Networking UI Placeholder ---
-            ui.separator();
-            ui.heading("Networking");
-
-            ui.label("Listen for Incoming Connections:");
-            ui.horizontal(|ui| {
-                if !self.is_listening && self.tcp_listener_handle.is_none() {
-                    if ui.button("Start Listening").clicked() {
-                        if self.is_connected { 
-                            self.server_status = "Cannot start listening while already connected/connecting.".to_string();
-                        } else {
-                            self.server_status = format!("Attempting to listen on 0.0.0.0:{}...", DEFAULT_PORT);
-                            let (server_tx_channel, server_rx_channel) = channel::<ServerThreadMessage>();
-                            self.server_gui_rx = Some(server_rx_channel);
-                            
-                            let listen_addr = format!("0.0.0.0:{}", DEFAULT_PORT);
-
-                            let handle = thread::spawn(move || {
-                                println!("Server listener thread: Attempting to bind to {}", listen_addr);
-                                match TcpListener::bind(&listen_addr) {
-                                    Ok(listener) => {
-                                        if let Ok(local_addr) = listener.local_addr() {
-                                            server_tx_channel.send(ServerThreadMessage::Listening(local_addr)).unwrap_or_else(|e| eprintln!("GUI channel closed, can't send Listening status: {}",e));
-                                        } else {
-                                            server_tx_channel.send(ServerThreadMessage::BindError("Failed to get local address after bind".to_string())).unwrap_or_else(|e| eprintln!("GUI channel closed, can't send BindError: {}",e));
-                                            return;
-                                        }
-
-                                        println!("Server listener thread: Bound successfully, now accepting connections on {}.", listen_addr);
-                                        // Loop to accept connections. This loop will block until a connection is made or an error occurs.
-                                        for stream_result in listener.incoming() { 
-                                            match stream_result {
-                                                Ok(stream) => {
-                                                    if let Ok(peer_addr) = stream.peer_addr() {
-                                                        println!("Server listener thread: Accepted new connection from {}", peer_addr);
-                                                        if server_tx_channel.send(ServerThreadMessage::NewConnection(stream, peer_addr)).is_err() {
-                                                            println!("Server listener thread: GUI channel closed, cannot send new connection. Dropping connection & stopping listener thread.");
-                                                            break; // Stop accepting if GUI is gone
-                                                        }
-                                                        // For a simple KVM, we typically want one connection at a time.
-                                                        // After successfully sending one connection to the GUI, we can stop this listener thread.
-                                                        // The GUI will then manage this one connection.
-                                                        // If the GUI wants to listen again, it can press "Start Listening" again (after disconnecting).
-                                                        println!("Server listener thread: Sent NewConnection to GUI. Stopping listener thread.");
-                                                        break; 
-                                                    } else {
-                                                        eprintln!("Server listener thread: Accepted connection but failed to get peer address. Dropping.");
-                                                        drop(stream); // Close it if peer_addr fails
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    eprintln!("Server listener thread: Error accepting connection: {}", e);
-                                                    server_tx_channel.send(ServerThreadMessage::AcceptError(e.to_string())).unwrap_or_else(|e_send| eprintln!("GUI channel closed, can't send AcceptError: {}", e_send));
-                                                    break; // Stop on accept error
-                                                }
-                                            }
-                                        }
-                                        println!("Server listener thread: Exited accept loop.");
-                                    }
-                                    Err(e) => {
-                                        eprintln!("Server listener thread: Failed to bind to {}: {}", listen_addr, e);
-                                        server_tx_channel.send(ServerThreadMessage::BindError(e.to_string())).unwrap_or_else(|e_send| eprintln!("GUI channel closed, can't send BindError: {}", e_send));
-                                    }
-                                }
-                            });
-                            self.tcp_listener_handle = Some(handle);
-                        }
-                    }
-                } else if self.is_listening { // is_listening is true OR tcp_listener_handle is Some
-                    if ui.button("Stop Listening").clicked() {
-                        println!("Stop Listening clicked.");
-                        // To properly stop the listener thread that's blocking on `listener.incoming()` or `listener.accept()`,
-                        // the ideal way is to close the TcpListener from another thread. 
-                        // However, we don't store the TcpListener in MyApp directly. The thread owns it.
-                        // A more advanced approach would involve sending a signal to the listener thread to close its listener and exit.
-                        // For now, taking the handle is a basic step. The OS will clean up the listening socket when the app exits
-                        // or if the thread panics/exits. If the listener thread is stuck in accept(), simply taking the handle
-                        // won't stop it immediately. It might error out if the app closes its side of the channel.
-
-                        if let Some(handle) = self.tcp_listener_handle.take() {
-                            println!("Server listener thread handle taken. Actual stop depends on thread behavior.");
-                            // Note: Joining here would block the GUI if the listener thread doesn't exit quickly.
-                            // handle.join().expect("Listener thread panic"); 
-                        }
-                        self.is_listening = false; // Assume we are stopping
-                        self.server_status = "Listener stop requested.".to_string();
-                        // We might need to also close self.tcp_stream if it was established via this listener.
-                        // For now, the main Disconnect button handles self.tcp_stream.
-                    }
-                }
-                ui.label(format!("Server Status: {}", self.server_status));
-            });
-            
-            ui.label("My Connection Details (for others to connect to me):");
-            ui.horizontal(|ui| {
-                ui.label(format!("Listening on Port (if active): {}", if self.is_listening { DEFAULT_PORT.to_string() } else { "N/A".to_string() } ));
-                ui.label(format!("Local IP Address: {}", self.my_local_ip));
-            });
-
-            ui.separator();
-            ui.label("Connect to Peer:");
-            ui.horizontal(|ui| {
-                ui.label("Peer Address/ID (e.g., 127.0.0.1:7878):");
-                ui.add_enabled(!self.is_connected && self.connection_thread_handle.is_none(), 
-                    egui::TextEdit::singleline(&mut self.peer_address_input)
-                );
-            });
-
-            if self.connection_thread_handle.is_some() {
-                ui.label("Processing connection attempt...");
-            } else if !self.is_connected {
-                if ui.button("Connect").clicked() {
-                    if !self.peer_address_input.is_empty() {
-                        self.connection_status = format!("Attempting to connect to {}...", self.peer_address_input);
-                        let (conn_tx, conn_rx) = channel::<ConnectionThreadMessage>();
-                        self.connection_gui_rx = Some(conn_rx);
-                        let peer_addr_clone = self.peer_address_input.clone();
-                        
-                        let handle = thread::spawn(move || {
-                            let mut addr_to_connect = peer_addr_clone.clone(); 
-                            if !addr_to_connect.contains(':') {
-                                println!("Port not specified for {}, appending default port {}.", addr_to_connect, DEFAULT_PORT);
-                                addr_to_connect = format!("{}:{}", addr_to_connect, DEFAULT_PORT);
-                            }
- 
-                            println!("Connection thread: Attempting to connect to {}", addr_to_connect);
-                            match TcpStream::connect(&addr_to_connect) {
-                                Ok(stream) => {
-                                    println!("Connection thread: Successfully connected to {}", addr_to_connect);
-                                    conn_tx.send(ConnectionThreadMessage::Connected(stream)).unwrap_or_else(|e| eprintln!("GUI channel closed, can't send Connected: {}",e));
-                                }
-                                Err(e) => {
-                                    eprintln!("Connection thread: Failed to connect to {}: {}", addr_to_connect, e);
-                                    conn_tx.send(ConnectionThreadMessage::ConnectionFailed(e.to_string())).unwrap_or_else(|e| eprintln!("GUI channel closed, can't send ConnectionFailed: {}",e));
-                                }
-                            }
-                        });
-                        self.connection_thread_handle = Some(handle);
-                    } else {
-                        self.connection_status = "Error: Peer address is empty.".to_string();
-                    }
-                }
-            } else { 
-                if ui.button("Disconnect").clicked() {
-                    if let Some(stream) = self.tcp_stream.take() {
-                        println!("Disconnecting from peer...");
-                        if let Err(e) = stream.shutdown(Shutdown::Both) {
-                            eprintln!("Error shutting down TCP stream: {}", e);
-                        }
-                    }
-                    self.is_connected = false;
-                    self.connection_status = "Disconnected".to_string();
-                    if let Some(handle) = self.connection_thread_handle.take() {
-                        handle.join().expect("Connection thread (during disconnect) failed to join");
-                    }
-                    // If we disconnect, we should probably allow listening again if it was stopped due to a connection.
-                    // For now, the user has to manually restart listening.
-                }
-            }
-            ui.label(format!("Connection Status: {}", self.connection_status));
-            // --- End Networking UI Placeholder ---
-
+            draw_networking_panel(
+                ui,
+                &mut self.is_listening,
+                &mut self.tcp_listener_handle,
+                &mut self.server_status,
+                &mut self.server_gui_rx,
+                &mut self.is_connected,
+                &mut self.peer_address_input,
+                &mut self.connection_thread_handle,
+                &mut self.connection_status,
+                &mut self.connection_gui_rx,
+                &mut self.tcp_stream,
+                &self.my_local_ip,
+            );
         });
 
         // Request a repaint if the listener might be active, to process messages
@@ -666,8 +330,6 @@ impl eframe::App for MyApp {
         }
     }
 }
-
-const DEFAULT_PORT: u16 = 7878;
 
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
